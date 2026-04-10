@@ -35,5 +35,3 @@ void main(void) {
     }
 }
 
-
-this is my main.c
