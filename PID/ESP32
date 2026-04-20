@@ -1,56 +1,166 @@
 #include <WiFi.h>
 
-const char* ssid = "vivoY31";
+// ================= DEBUG CONTROL =================
+// Set to 1 to enable debug prints, 0 to disable
+#define DEBUG 1
+
+#if DEBUG
+  #define DBG_PRINT(x) Serial.print(x)
+  #define DBG_PRINTLN(x) Serial.println(x)
+#else
+  #define DBG_PRINT(x)
+  #define DBG_PRINTLN(x)
+#endif
+// =================================================
+
+// WiFi credentials
+const char* ssid = "vivoY31";  //Common wifi for laptop(website host) & ESP
 const char* password = "abcd1234";
 
 WiFiServer server(80);
 
+// UART pins
+#define TXD2 17
+#define RXD2 16
+
+// Queue for PID data transfer between cores
+QueueHandle_t pidQueue;
+
+// Structure for PID values
+typedef struct {
+  float P;
+  float I;
+  float D;
+} PIDData;
+
+// ================= UART TASK (CORE 1) =================
+void uartTask(void *pvParameters) {
+  PIDData receivedPID;
+
+  while (1) {
+    // Wait for data from queue
+    if (xQueueReceive(pidQueue, &receivedPID, portMAX_DELAY) == pdTRUE) {
+
+      // Convert to scaled integers (better for FPGA)
+      int p_int = receivedPID.P * 100;
+      int i_int = receivedPID.I * 100;
+      int d_int = receivedPID.D * 100;
+
+      // Send structured data
+      Serial2.printf("<%d,%d,%d>\n", p_int, i_int, d_int);
+
+      DBG_PRINT("UART Sent: ");
+      DBG_PRINT(p_int);
+      DBG_PRINT(", ");
+      DBG_PRINT(i_int);
+      DBG_PRINT(", ");
+      DBG_PRINTLN(d_int);
+
+      // Small delay for FPGA stability
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+}
+
+// ================= WIFI TASK (CORE 0) =================
+void wifiTask(void *pvParameters) {
+  while (1) {
+    WiFiClient client = server.available();
+
+    if (client) {
+      DBG_PRINTLN("Client Connected");
+
+      String request = client.readStringUntil('\r');
+      client.flush();
+
+      DBG_PRINT("Request: ");
+      DBG_PRINTLN(request);
+
+      if (request.indexOf("/pid?") != -1) {
+
+        int pIndex = request.indexOf("p=");
+        int iIndex = request.indexOf("i=");
+        int dIndex = request.indexOf("d=");
+
+        float P = request.substring(pIndex + 2, request.indexOf("&", pIndex)).toFloat();
+        float I = request.substring(iIndex + 2, request.indexOf("&", iIndex)).toFloat();
+        float D = request.substring(dIndex + 2).toFloat();
+
+        DBG_PRINT("Parsed PID: ");
+        DBG_PRINT(P); DBG_PRINT(", ");
+        DBG_PRINT(I); DBG_PRINT(", ");
+        DBG_PRINTLN(D);
+
+        // Send to UART task via queue
+        PIDData pid = {P, I, D};
+        xQueueSend(pidQueue, &pid, portMAX_DELAY);
+      }
+
+      // HTTP response
+      client.println("HTTP/1.1 200 OK");
+      client.println("Content-type:text/plain");
+      client.println("Connection: close");
+      client.println();
+      client.println("OK");
+
+      client.stop();
+      DBG_PRINTLN("Client Disconnected");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
 
+  DBG_PRINT("CPU Frequency: ");
+  DBG_PRINT(getCpuFrequencyMhz());
+  DBG_PRINTLN(" MHz");
+
+  // WiFi connect
   WiFi.begin(ssid, password);
-  Serial.print("Connecting");
+  DBG_PRINT("Connecting to WiFi");
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    Serial.print(".");
+    DBG_PRINT(".");
   }
 
-  Serial.println("\nConnected!");
-  Serial.print("ESP32 IP: ");
-  Serial.println(WiFi.localIP());
+  DBG_PRINTLN("\nWiFi Connected");
+  DBG_PRINT("IP Address: ");
+  DBG_PRINTLN(WiFi.localIP());
 
   server.begin();
+
+  // Create queue
+  pidQueue = xQueueCreate(5, sizeof(PIDData));
+
+  // Create tasks
+  xTaskCreatePinnedToCore(
+    uartTask,
+    "UART Task",
+    4096,
+    NULL,
+    2,        // Higher priority
+    NULL,
+    1         // Core 1
+  );
+
+  xTaskCreatePinnedToCore(
+    wifiTask,
+    "WiFi Task",
+    8192,
+    NULL,
+    1,        // Lower priority
+    NULL,
+    0         // Core 0
+  );
 }
 
+// ================= LOOP =================
 void loop() {
-  WiFiClient client = server.available();
-  if (!client) return;
-
-  String request = client.readStringUntil('\r');
-  client.flush();
-
-  // ===== Check PID request =====
-  if (request.indexOf("/pid?") != -1) {
-
-    int pIndex = request.indexOf("p=");
-    int iIndex = request.indexOf("i=");
-    int dIndex = request.indexOf("d=");
-
-    float P = request.substring(pIndex + 2, request.indexOf("&", pIndex)).toFloat();
-    float I = request.substring(iIndex + 2, request.indexOf("&", iIndex)).toFloat();
-    float D = request.substring(dIndex + 2).toFloat();
-
-    Serial.print("Received PID -> ");
-    Serial.print("P: "); Serial.print(P);
-    Serial.print(" I: "); Serial.print(I);
-    Serial.print(" D: "); Serial.println(D);
-  }
-
-  // ===== Response =====
-  client.println("HTTP/1.1 200 OK");
-  client.println("Content-type:text/plain");
-  client.println("Connection: close");
-  client.println();
-  client.println("OK");
+  // Empty (FreeRTOS handles everything)
 }
