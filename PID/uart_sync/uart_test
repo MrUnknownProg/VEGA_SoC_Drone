@@ -1,0 +1,88 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include "debug_uart.h" 
+#include "config.h"
+
+// --- CONFIGURATION ---
+// If you still get garbage, try changing this to 50000000 or 25000000
+#define SYSTEM_FREQ        40000000 
+#define TARGET_BAUD        115200
+
+/* UART0 Register Map (0x1000_0100) */
+#define UART0_BASE 0x10000100
+#define UART0_REG(offset) (*(volatile uint32_t *)(UART0_BASE + offset))
+
+/* UART2 Register Map (0x1000_0300) */
+#define UART2_BASE 0x10000300
+#define UART2_REG(offset) (*(volatile uint32_t *)(UART2_BASE + offset))
+
+// Register Offsets
+#define REG_DATA   0x00
+#define REG_DLL    0x00
+#define REG_DLM    0x04
+#define REG_IER    0x04
+#define REG_FCR    0x08
+#define REG_LCR    0x0C
+#define REG_LSR    0x14
+
+/**
+ * Robust Hardware Initialization
+ */
+void uart_init_hw(uint32_t base, uint32_t baud) {
+    uint32_t divisor = SYSTEM_FREQ / (16 * baud);
+    
+    volatile uint32_t *lcr = (volatile uint32_t *)(base + REG_LCR);
+    volatile uint32_t *dll = (volatile uint32_t *)(base + REG_DLL);
+    volatile uint32_t *dlm = (volatile uint32_t *)(base + REG_DLM);
+    volatile uint32_t *fcr = (volatile uint32_t *)(base + REG_FCR);
+    volatile uint32_t *ier = (volatile uint32_t *)(base + REG_IER);
+
+    *ier = 0x00;          // Disable interrupts
+    *lcr = 0x83;          // Enable DLAB
+    *dll = divisor & 0xFF;
+    *dlm = (divisor >> 8) & 0xFF;
+    *lcr = 0x03;          // 8N1 (8 data bits, 1 stop bit, no parity)
+    *fcr = 0x07;          // FIFO Enable & Clear
+}
+
+void main() {
+    char rx_buffer[64];
+    int idx = 0;
+
+    // Initialize both hardware blocks
+    uart_init_hw(UART0_BASE, TARGET_BAUD);
+    uart_init_hw(UART2_BASE, TARGET_BAUD);
+
+    printf("\r\n[SYSTEM] UARTS INITIALIZED AT %d Hz\r\n", SYSTEM_FREQ);
+    printf("[SYSTEM] UART0: PC | UART2: ESP32\r\n");
+
+    while (1) {
+        // Poll UART2 (ESP32)
+        if (UART2_REG(REG_LSR) & 0x01) {
+            char c = (char)(UART2_REG(REG_DATA) & 0xFF);
+
+            // RAW ECHO: Send every byte received from UART2 directly to UART0
+            // This helps diagnose if the issue is the physical connection or the logic
+            while (!(UART0_REG(REG_LSR) & 0x20)); 
+            UART0_REG(REG_DATA) = c;
+
+            // Packet Handling
+            if (c == '\n' || c == '\r') {
+                if (idx > 0) {
+                    rx_buffer[idx] = '\0';
+                    
+                    // Simple parsing for PID values
+                    if (rx_buffer[0] == 'P' || rx_buffer[0] == 'I' || rx_buffer[0] == 'D') {
+                        float val = atof(&rx_buffer[1]);
+                        printf("\r\n>> PID UPDATE: %c = %.4f\r\n", rx_buffer[0], val);
+                    }
+                    idx = 0;
+                }
+            } 
+            else if (idx < 63 && c >= 32) { // Store printable chars only
+                rx_buffer[idx++] = c;
+            }
+        }
+    }
+}
