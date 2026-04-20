@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP32 PID Control</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+  <h2>PID Controller</h2>
+
+  P: <input id="p"><br><br>
+  I: <input id="i"><br><br>
+  D: <input id="d"><br><br>
+
+  <button onclick="sendPID()">Send</button>
+
+  <h3>Live IMU Graph</h3>
+  <canvas id="chart"></canvas>
+
+<script>
+let ws = new WebSocket("ws://" + location.host + "/ws");
+
+function sendPID() {
+  let p = document.getElementById("p").value;
+  let i = document.getElementById("i").value;
+  let d = document.getElementById("d").value;
+
+  fetch("http://10.97.222.62/pid?p=" + p + "&i=" + i + "&d=" + d);
+}
+
+const ctx = document.getElementById('chart').getContext('2d');
+
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [{
+      label: 'IMU',
+      data: []
+    }]
+  }
+});
+
+ws.onmessage = function(event) {
+  let obj = JSON.parse(event.data);
+
+  chart.data.labels.push('');
+  chart.data.datasets[0].data.push(obj.imu);
+
+  if (chart.data.labels.length > 50) {
+    chart.data.labels.shift();
+    chart.data.datasets[0].data.shift();
+  }
+
+  chart.update();
+};
+</script>
+
+</body>
+</html>
