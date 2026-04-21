@@ -1,20 +1,21 @@
 #include <WiFi.h>
 
 // ================= DEBUG CONTROL =================
-// Set to 1 to enable debug prints, 0 to disable
 #define DEBUG 1
 
 #if DEBUG
   #define DBG_PRINT(x) Serial.print(x)
   #define DBG_PRINTLN(x) Serial.println(x)
+  #define DBG_PRINTF(...) Serial.printf(__VA_ARGS__)
 #else
   #define DBG_PRINT(x)
   #define DBG_PRINTLN(x)
+  #define DBG_PRINTF(...)
 #endif
 // =================================================
 
 // WiFi credentials
-const char* ssid = "vivoY31";  //Common wifi for laptop(website host) & ESP
+const char* ssid = "vivoY31";
 const char* password = "abcd1234";
 
 WiFiServer server(80);
@@ -23,88 +24,159 @@ WiFiServer server(80);
 #define TXD2 17
 #define RXD2 16
 
-// Queue for PID data transfer between cores
+// Queue for PID data
 QueueHandle_t pidQueue;
 
-// Structure for PID values
+// Shared flag for TX priority mode
+volatile bool uartTxActive = false;
+
+// Store latest FPGA data
+String lastUARTMessage = "";
+
+// PID struct
 typedef struct {
   float P;
   float I;
   float D;
 } PIDData;
 
-// ================= UART TASK (CORE 1) =================
-void uartTask(void *pvParameters) {
+// ================= UART TX TASK (CORE 1) =================
+void uartTxTask(void *pvParameters) {
   PIDData receivedPID;
 
+  DBG_PRINTLN("UART TX Task started");
+
   while (1) {
-    // Wait for data from queue
     if (xQueueReceive(pidQueue, &receivedPID, portMAX_DELAY) == pdTRUE) {
 
-      // Convert to scaled integers (better for FPGA)
-      int p_int = receivedPID.P * 100;
-      int i_int = receivedPID.I * 100;
-      int d_int = receivedPID.D * 100;
+      uartTxActive = true;   // 🚀 Enter TX mode
 
-      // Send structured data
+      // Flush any incoming garbage before TX
+      while (Serial2.available()) Serial2.read();
+
+      int p_int = (int)(receivedPID.P * 100.0f);
+      int i_int = (int)(receivedPID.I * 100.0f);
+      int d_int = (int)(receivedPID.D * 100.0f);
+
       Serial2.printf("<%d,%d,%d>\n", p_int, i_int, d_int);
+      Serial2.flush();
 
       DBG_PRINT("UART Sent: ");
-      DBG_PRINT(p_int);
-      DBG_PRINT(", ");
-      DBG_PRINT(i_int);
-      DBG_PRINT(", ");
+      DBG_PRINT(p_int); DBG_PRINT(", ");
+      DBG_PRINT(i_int); DBG_PRINT(", ");
       DBG_PRINTLN(d_int);
 
-      // Small delay for FPGA stability
-      vTaskDelay(pdMS_TO_TICKS(5));
+      // Give FPGA time to process
+      vTaskDelay(pdMS_TO_TICKS(20));
+
+      uartTxActive = false;  // ✅ Back to RX mode
     }
+  }
+}
+
+// ================= UART RX TASK (CORE 1) =================
+void uartRxTask(void *pvParameters) {
+  String rxBuffer = "";
+
+  DBG_PRINTLN("UART RX Task started");
+
+  while (1) {
+
+    // 🚫 Ignore RX during TX mode
+    if (uartTxActive) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
+
+    while (Serial2.available()) {
+      char c = Serial2.read();
+
+      DBG_PRINT(c);   // raw debug
+
+      if (c == '<') {
+        rxBuffer = "";
+      }
+      else if (c == '>') {
+        DBG_PRINT("\nPacket Received: ");
+        DBG_PRINTLN(rxBuffer);
+
+        lastUARTMessage = rxBuffer;
+        rxBuffer = "";
+      }
+      else {
+        rxBuffer += c;
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
 // ================= WIFI TASK (CORE 0) =================
 void wifiTask(void *pvParameters) {
+
   while (1) {
     WiFiClient client = server.available();
 
     if (client) {
-      DBG_PRINTLN("Client Connected");
+      //DBG_PRINTLN("Client Connected");
 
-      String request = client.readStringUntil('\r');
-      client.flush();
+      String requestLine = "";
+      unsigned long timeout = millis();
 
-      DBG_PRINT("Request: ");
-      DBG_PRINTLN(request);
-
-      if (request.indexOf("/pid?") != -1) {
-
-        int pIndex = request.indexOf("p=");
-        int iIndex = request.indexOf("i=");
-        int dIndex = request.indexOf("d=");
-
-        float P = request.substring(pIndex + 2, request.indexOf("&", pIndex)).toFloat();
-        float I = request.substring(iIndex + 2, request.indexOf("&", iIndex)).toFloat();
-        float D = request.substring(dIndex + 2).toFloat();
-
-        DBG_PRINT("Parsed PID: ");
-        DBG_PRINT(P); DBG_PRINT(", ");
-        DBG_PRINT(I); DBG_PRINT(", ");
-        DBG_PRINTLN(D);
-
-        // Send to UART task via queue
-        PIDData pid = {P, I, D};
-        xQueueSend(pidQueue, &pid, portMAX_DELAY);
+      // Reduced blocking time
+      while (client.connected() && millis() - timeout < 200) {
+        if (client.available()) {
+          requestLine = client.readStringUntil('\n');
+          requestLine.trim();
+          break;
+        }
       }
 
-      // HTTP response
+      //DBG_PRINT("Request: ");
+      //DBG_PRINTLN(requestLine);
+
+      // ===== HANDLE PID REQUEST =====
+      if (requestLine.startsWith("GET /pid?")) {
+
+        int pIndex = requestLine.indexOf("p=");
+        int iIndex = requestLine.indexOf("i=");
+        int dIndex = requestLine.indexOf("d=");
+
+        if (pIndex != -1 && iIndex != -1 && dIndex != -1) {
+
+          int pEnd = requestLine.indexOf("&", pIndex);
+          int iEnd = requestLine.indexOf("&", iIndex);
+          int dEnd = requestLine.indexOf(" ", dIndex);
+
+          float P = requestLine.substring(pIndex + 2, pEnd).toFloat();
+          float I = requestLine.substring(iIndex + 2, iEnd).toFloat();
+          float D = requestLine.substring(dIndex + 2, dEnd).toFloat();
+
+          DBG_PRINT("Parsed PID: ");
+          DBG_PRINT(P); DBG_PRINT(", ");
+          DBG_PRINT(I); DBG_PRINT(", ");
+          DBG_PRINTLN(D);
+
+          PIDData pid = {P, I, D};
+
+          if (xQueueSend(pidQueue, &pid, pdMS_TO_TICKS(100)) == pdTRUE) {
+            DBG_PRINTLN("Queue Send OK");
+          } else {
+            DBG_PRINTLN("Queue Send FAILED");
+          }
+        }
+      }
+
+      // ===== SEND FPGA DATA BACK TO CLIENT =====
       client.println("HTTP/1.1 200 OK");
       client.println("Content-type:text/plain");
       client.println("Connection: close");
       client.println();
-      client.println("OK");
+      client.println(lastUARTMessage);
 
       client.stop();
-      DBG_PRINTLN("Client Disconnected");
+      //DBG_PRINTLN("Client Disconnected");
     }
 
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -122,7 +194,7 @@ void setup() {
 
   // WiFi connect
   WiFi.begin(ssid, password);
-  DBG_PRINT("Connecting to WiFi");
+  DBG_PRINT("Connecting");
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -137,27 +209,15 @@ void setup() {
 
   // Create queue
   pidQueue = xQueueCreate(5, sizeof(PIDData));
+  if (pidQueue == NULL) {
+    DBG_PRINTLN("Queue creation failed!");
+    while (1) delay(1000);
+  }
 
   // Create tasks
-  xTaskCreatePinnedToCore(
-    uartTask,
-    "UART Task",
-    4096,
-    NULL,
-    2,        // Higher priority
-    NULL,
-    1         // Core 1
-  );
-
-  xTaskCreatePinnedToCore(
-    wifiTask,
-    "WiFi Task",
-    8192,
-    NULL,
-    1,        // Lower priority
-    NULL,
-    0         // Core 0
-  );
+  xTaskCreatePinnedToCore(uartTxTask, "UART TX", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(uartRxTask, "UART RX", 4096, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(wifiTask,   "WiFi",    8192, NULL, 1, NULL, 0);
 }
 
 // ================= LOOP =================
