@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <math.h>
 #include "config.h"
 
 // --- CONFIGURATION ---
@@ -11,26 +12,36 @@
 #define ISM_ADDR           0x6B
 #define MMC_ADDR           0x30
 
+#define RAD2DEG            57.295779f
+#define DEG2RAD            0.0174533f
+
 /* UART Register Mapping */
 #define UART0_BASE 0x10000100
 #define UART2_BASE 0x10000300
 #define UART_REG(base, off) (*(volatile uint32_t *)(base + off))
 
 #define REG_DATA   0x00
+#define REG_LSR    0x14
 #define REG_DLL    0x00
 #define REG_DLM    0x04
 #define REG_IER    0x04
 #define REG_FCR    0x08
 #define REG_LCR    0x0C
-#define REG_LSR    0x14
 
-// Buffers
+/* --- MAHONY STATE --- */
+float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+float Kp = 2.0f;
+float Ki = 0.05f;
+float exInt = 0, eyInt = 0, ezInt = 0;
+float dt = 0.04f; // Loop timing constant
+
+// Communication Buffers
 char rx_buffer[64];
 int rx_idx = 0;
 char msg_out[128];
 
 /**
- * Robust Hardware Initialization for both UARTs
+ * Robust Hardware Initialization
  */
 void uart_init_hw(uint32_t base, uint32_t baud) {
     uint32_t divisor = SYSTEM_FREQ / (16 * baud);
@@ -56,38 +67,47 @@ void write_reg(unsigned char addr, unsigned char reg, unsigned char val) {
     i2c_endTransmission(1);
 }
 
+void normalize_quat() {
+    float norm = sqrtf(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+    if(norm == 0) return;
+    q[0] /= norm; q[1] /= norm; q[2] /= norm; q[3] /= norm;
+}
+
 int main() {
-    // Initial hardware setup
+    // 1. Hardware Setup
     uart_init_hw(UART0_BASE, TARGET_BAUD);
     uart_init_hw(UART2_BASE, TARGET_BAUD);
     i2c_init(0); 
 
-    printf("\r\n--- Duplex Drone Link Active [%d Hz] ---\r\n", SYSTEM_FREQ);
+    printf("\r\n--- Duplex Mahony AHRS Link Active ---\r\n");
 
-    // Sensor Initialization
+    // 2. Sensor Initialization
     write_reg(ISM_ADDR, 0x10, 0x60); // Accel 416Hz
     write_reg(ISM_ADDR, 0x11, 0x60); // Gyro 416Hz
-    write_reg(MMC_ADDR, 0x09, 0x10); // Reset Magnetometer
+    write_reg(MMC_ADDR, 0x09, 0x10); // Mag Reset
     for(volatile int i=0; i<500000; i++);
 
     while (1) {
-        // --- 1. RECEIVE FROM ESP32 (Non-blocking Polling) ---
+        // --- 3. RECEIVE FROM ESP32 (Non-blocking) ---
         if (UART_REG(UART2_BASE, REG_LSR) & 0x01) {
             char c = (char)(UART_REG(UART2_BASE, REG_DATA) & 0xFF);
-
-            // Echo raw char to PC for immediate feedback
+            
+            // Echo raw char to PC Terminal (UART0) with fixed formatting
             while (!(UART_REG(UART0_BASE, REG_LSR) & 0x20)); 
             UART_REG(UART0_BASE, REG_DATA) = c;
+            if (c == '\n') { // Ensure newline on PC moves cursor to start
+                while (!(UART_REG(UART0_BASE, REG_LSR) & 0x20)); 
+                UART_REG(UART0_BASE, REG_DATA) = '\r';
+            }
 
             if (c == '\n' || c == '\r') {
                 if (rx_idx > 0) {
                     rx_buffer[rx_idx] = '\0';
-                    // Check for PID updates or other commands
+                    // Dynamic tuning via ESP32
                     if (rx_buffer[0] == 'P' || rx_buffer[0] == 'I' || rx_buffer[0] == 'D') {
-                        float val = atof(&rx_buffer[1]);
-                        printf("\r\n>> PID UPDATE: %c = %.4f\r\n", rx_buffer[0], val);
-                    } else {
-                        printf("\r\n>> CMD RECV: %s\r\n", rx_buffer);
+                        if (rx_buffer[0] == 'P') Kp = atof(&rx_buffer[1]);
+                        if (rx_buffer[0] == 'I') Ki = atof(&rx_buffer[1]);
+                        printf("\r\n>> GAIN UPDATE: Kp=%.2f, Ki=%.2f\r\n", Kp, Ki);
                     }
                     rx_idx = 0;
                 }
@@ -96,8 +116,7 @@ int main() {
             }
         }
 
-        // --- 2. SENSOR ACQUISITION ---
-        // Accel & Gyro
+        // --- 4. SENSOR ACQUISITION ---
         uint8_t buf[12];
         i2c_beginTransmission(ISM_ADDR);
         i2c_write(0x22); 
@@ -114,39 +133,66 @@ int main() {
             az = (int16_t)(buf[11] << 8 | buf[10]);
         }
 
-        // Magnetometer (Trigger and Read)
+        // Mag Trigger
         write_reg(MMC_ADDR, 0x09, 0x01); 
         unsigned char status = 0;
         int timeout = 500; 
         while (!(status & 0x01) && timeout-- > 0) {
             i2c_beginTransmission(MMC_ADDR);
-            i2c_write(0x08); 
-            i2c_endTransmission(1);
+            i2c_write(0x08); i2c_endTransmission(1);
             i2c_requestFrom(MMC_ADDR, 1, 1);
             status = i2c_read();
         }
 
-        int32_t mx=0, my=0, mz=0;
+        float mx=0, my=0, mz=0;
         if (timeout > 0) {
             i2c_beginTransmission(MMC_ADDR);
-            i2c_write(0x00); 
-            i2c_endTransmission(1);
+            i2c_write(0x00); i2c_endTransmission(1);
             if (i2c_requestFrom(MMC_ADDR, 6, 1)) {
                 uint8_t mlx = i2c_read(); uint8_t mmx = i2c_read();
                 uint8_t mly = i2c_read(); uint8_t mmy = i2c_read();
                 uint8_t mlz = i2c_read(); uint8_t mmz = i2c_read();
-                mx = (int32_t)((mmx << 8) | mlx) - 32768;
-                my = (int32_t)((mmy << 8) | mly) - 32768;
-                mz = (int32_t)((mmz << 8) | mlz) - 32768;
+                mx = (float)((int32_t)((mmx << 8) | mlx) - 32768);
+                my = (float)((int32_t)((mmy << 8) | mly) - 32768);
+                mz = (float)((int32_t)((mmz << 8) | mlz) - 32768);
             }
         }
 
-        // --- 3. TELEMETRY OUTPUT ---
-        // Formatting for ESP32 Web Graph
-        sprintf(msg_out, "%d,%d,%d,%d,%d,%d,%ld,%ld,%ld\r\n", ax, ay, az, gx, gy, gz, mx, my, mz);
+        // --- 5. MAHONY FILTER CALCULATION ---
+        float axf = ax / 16384.0f, ayf = ay / 16384.0f, azf = az / 16384.0f;
+        float gxf = gx * 0.00875f * DEG2RAD, gyf = gy * 0.00875f * DEG2RAD, gzf = gz * 0.00875f * DEG2RAD;
+
+        float norm_a = sqrtf(axf*axf + ayf*ayf + azf*azf);
+        if(norm_a > 0.7f && norm_a < 1.3f) {
+            axf/=norm_a; ayf/=norm_a; azf/=norm_a;
+            float vx = 2*(q[1]*q[3] - q[0]*q[2]);
+            float vy = 2*(q[0]*q[1] + q[2]*q[3]);
+            float vz = q[0]*q[0] - q[1]*q[1] - q[2]*q[2] + q[3]*q[3];
+            float ex = (ayf*vz - azf*vy), ey = (azf*vx - axf*vz), ez = (axf*vy - ayf*vx);
+            exInt += ex * Ki; eyInt += ey * Ki; ezInt += ez * Ki;
+            gxf += Kp*ex + exInt; gyf += Kp*ey + eyInt; gzf += Kp*ez + ezInt;
+        }
+
+        // Quaternion Integration
+        float qDot0 = 0.5f * (-q[1]*gxf - q[2]*gyf - q[3]*gzf);
+        float qDot1 = 0.5f * ( q[0]*gxf + q[2]*gzf - q[3]*gyf);
+        float qDot2 = 0.5f * ( q[0]*gyf - q[1]*gzf + q[3]*gxf);
+        float qDot3 = 0.5f * ( q[0]*gzf + q[1]*gyf - q[2]*gxf);
+        q[0] += qDot0*dt; q[1] += qDot1*dt; q[2] += qDot2*dt; q[3] += qDot3*dt;
+        normalize_quat();
+
+        // --- 6. EULER CONVERSION & TRANSMISSION ---
+        float roll  = atan2f(2*(q[0]*q[1] + q[2]*q[3]), 1 - 2*(q[1]*q[1] + q[2]*q[2])) * RAD2DEG;
+        float pitch = asinf(2*(q[0]*q[2] - q[3]*q[1])) * RAD2DEG;
+        float yaw   = atan2f(2*(q[0]*q[3] + q[1]*q[2]), 1 - 2*(q[2]*q[2] + q[3]*q[3])) * RAD2DEG;
+
+        // Use \r\n to prevent the staircase effect in terminal
+        sprintf(msg_out, "<%.2f,%.2f,%.2f>\r\n", roll, pitch, yaw);
         uart2_print(msg_out); 
 
-        // Balanced delay: short enough for flight response, long enough for ESP32 processing
-        for (volatile int i = 0; i < 100000; i++); 
+        // PC Monitor Output (UART0)
+        //printf("<%.2f,%.2f,%.2f>\r\n", roll, pitch, yaw);
+
+        for (volatile int i = 0; i < 150000; i++); 
     }
 }
