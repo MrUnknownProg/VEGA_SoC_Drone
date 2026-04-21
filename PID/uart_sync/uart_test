@@ -1,23 +1,21 @@
+#include "i2c_api.h"
+#include "debug_uart.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include "debug_uart.h" 
 #include "config.h"
 
 // --- CONFIGURATION ---
-// If you still get garbage, try changing this to 50000000 or 25000000
 #define SYSTEM_FREQ        40000000 
 #define TARGET_BAUD        115200
+#define ISM_ADDR           0x6B
+#define MMC_ADDR           0x30
 
-/* UART0 Register Map (0x1000_0100) */
+/* UART Register Mapping */
 #define UART0_BASE 0x10000100
-#define UART0_REG(offset) (*(volatile uint32_t *)(UART0_BASE + offset))
-
-/* UART2 Register Map (0x1000_0300) */
 #define UART2_BASE 0x10000300
-#define UART2_REG(offset) (*(volatile uint32_t *)(UART2_BASE + offset))
+#define UART_REG(base, off) (*(volatile uint32_t *)(base + off))
 
-// Register Offsets
 #define REG_DATA   0x00
 #define REG_DLL    0x00
 #define REG_DLM    0x04
@@ -26,63 +24,129 @@
 #define REG_LCR    0x0C
 #define REG_LSR    0x14
 
+// Buffers
+char rx_buffer[64];
+int rx_idx = 0;
+char msg_out[128];
+
 /**
- * Robust Hardware Initialization
+ * Robust Hardware Initialization for both UARTs
  */
 void uart_init_hw(uint32_t base, uint32_t baud) {
     uint32_t divisor = SYSTEM_FREQ / (16 * baud);
-    
-    volatile uint32_t *lcr = (volatile uint32_t *)(base + REG_LCR);
-    volatile uint32_t *dll = (volatile uint32_t *)(base + REG_DLL);
-    volatile uint32_t *dlm = (volatile uint32_t *)(base + REG_DLM);
-    volatile uint32_t *fcr = (volatile uint32_t *)(base + REG_FCR);
-    volatile uint32_t *ier = (volatile uint32_t *)(base + REG_IER);
-
-    *ier = 0x00;          // Disable interrupts
-    *lcr = 0x83;          // Enable DLAB
-    *dll = divisor & 0xFF;
-    *dlm = (divisor >> 8) & 0xFF;
-    *lcr = 0x03;          // 8N1 (8 data bits, 1 stop bit, no parity)
-    *fcr = 0x07;          // FIFO Enable & Clear
+    UART_REG(base, REG_IER) = 0x00;
+    UART_REG(base, REG_LCR) = 0x83; // DLAB Enable
+    UART_REG(base, REG_DLL) = divisor & 0xFF;
+    UART_REG(base, REG_DLM) = (divisor >> 8) & 0xFF;
+    UART_REG(base, REG_LCR) = 0x03; // 8N1
+    UART_REG(base, REG_FCR) = 0x07; // FIFO Enable
 }
 
-void main() {
-    char rx_buffer[64];
-    int idx = 0;
+void uart2_print(char *str) {
+    while (*str) {
+        while (!(UART_REG(UART2_BASE, REG_LSR) & 0x20));
+        UART_REG(UART2_BASE, REG_DATA) = *str++;
+    }
+}
 
-    // Initialize both hardware blocks
+void write_reg(unsigned char addr, unsigned char reg, unsigned char val) {
+    i2c_beginTransmission(addr);
+    i2c_write(reg);
+    i2c_write(val);
+    i2c_endTransmission(1);
+}
+
+int main() {
+    // Initial hardware setup
     uart_init_hw(UART0_BASE, TARGET_BAUD);
     uart_init_hw(UART2_BASE, TARGET_BAUD);
+    i2c_init(0); 
 
-    printf("\r\n[SYSTEM] UARTS INITIALIZED AT %d Hz\r\n", SYSTEM_FREQ);
-    printf("[SYSTEM] UART0: PC | UART2: ESP32\r\n");
+    printf("\r\n--- Duplex Drone Link Active [%d Hz] ---\r\n", SYSTEM_FREQ);
+
+    // Sensor Initialization
+    write_reg(ISM_ADDR, 0x10, 0x60); // Accel 416Hz
+    write_reg(ISM_ADDR, 0x11, 0x60); // Gyro 416Hz
+    write_reg(MMC_ADDR, 0x09, 0x10); // Reset Magnetometer
+    for(volatile int i=0; i<500000; i++);
 
     while (1) {
-        // Poll UART2 (ESP32)
-        if (UART2_REG(REG_LSR) & 0x01) {
-            char c = (char)(UART2_REG(REG_DATA) & 0xFF);
+        // --- 1. RECEIVE FROM ESP32 (Non-blocking Polling) ---
+        if (UART_REG(UART2_BASE, REG_LSR) & 0x01) {
+            char c = (char)(UART_REG(UART2_BASE, REG_DATA) & 0xFF);
 
-            // RAW ECHO: Send every byte received from UART2 directly to UART0
-            // This helps diagnose if the issue is the physical connection or the logic
-            while (!(UART0_REG(REG_LSR) & 0x20)); 
-            UART0_REG(REG_DATA) = c;
+            // Echo raw char to PC for immediate feedback
+            while (!(UART_REG(UART0_BASE, REG_LSR) & 0x20)); 
+            UART_REG(UART0_BASE, REG_DATA) = c;
 
-            // Packet Handling
             if (c == '\n' || c == '\r') {
-                if (idx > 0) {
-                    rx_buffer[idx] = '\0';
-                    
-                    // Simple parsing for PID values
+                if (rx_idx > 0) {
+                    rx_buffer[rx_idx] = '\0';
+                    // Check for PID updates or other commands
                     if (rx_buffer[0] == 'P' || rx_buffer[0] == 'I' || rx_buffer[0] == 'D') {
                         float val = atof(&rx_buffer[1]);
                         printf("\r\n>> PID UPDATE: %c = %.4f\r\n", rx_buffer[0], val);
+                    } else {
+                        printf("\r\n>> CMD RECV: %s\r\n", rx_buffer);
                     }
-                    idx = 0;
+                    rx_idx = 0;
                 }
-            } 
-            else if (idx < 63 && c >= 32) { // Store printable chars only
-                rx_buffer[idx++] = c;
+            } else if (rx_idx < 63 && c >= 32) {
+                rx_buffer[rx_idx++] = c;
             }
         }
+
+        // --- 2. SENSOR ACQUISITION ---
+        // Accel & Gyro
+        uint8_t buf[12];
+        i2c_beginTransmission(ISM_ADDR);
+        i2c_write(0x22); 
+        i2c_endTransmission(1);
+        
+        int16_t gx=0, gy=0, gz=0, ax=0, ay=0, az=0;
+        if (i2c_requestFrom(ISM_ADDR, 12, 1)) {
+            for(int i=0; i<12; i++) buf[i] = i2c_read();
+            gx = (int16_t)(buf[1] << 8 | buf[0]);
+            gy = (int16_t)(buf[3] << 8 | buf[2]);
+            gz = (int16_t)(buf[5] << 8 | buf[4]);
+            ax = (int16_t)(buf[7] << 8 | buf[6]);
+            ay = (int16_t)(buf[9] << 8 | buf[8]);
+            az = (int16_t)(buf[11] << 8 | buf[10]);
+        }
+
+        // Magnetometer (Trigger and Read)
+        write_reg(MMC_ADDR, 0x09, 0x01); 
+        unsigned char status = 0;
+        int timeout = 500; 
+        while (!(status & 0x01) && timeout-- > 0) {
+            i2c_beginTransmission(MMC_ADDR);
+            i2c_write(0x08); 
+            i2c_endTransmission(1);
+            i2c_requestFrom(MMC_ADDR, 1, 1);
+            status = i2c_read();
+        }
+
+        int32_t mx=0, my=0, mz=0;
+        if (timeout > 0) {
+            i2c_beginTransmission(MMC_ADDR);
+            i2c_write(0x00); 
+            i2c_endTransmission(1);
+            if (i2c_requestFrom(MMC_ADDR, 6, 1)) {
+                uint8_t mlx = i2c_read(); uint8_t mmx = i2c_read();
+                uint8_t mly = i2c_read(); uint8_t mmy = i2c_read();
+                uint8_t mlz = i2c_read(); uint8_t mmz = i2c_read();
+                mx = (int32_t)((mmx << 8) | mlx) - 32768;
+                my = (int32_t)((mmy << 8) | mly) - 32768;
+                mz = (int32_t)((mmz << 8) | mlz) - 32768;
+            }
+        }
+
+        // --- 3. TELEMETRY OUTPUT ---
+        // Formatting for ESP32 Web Graph
+        sprintf(msg_out, "%d,%d,%d,%d,%d,%d,%ld,%ld,%ld\r\n", ax, ay, az, gx, gy, gz, mx, my, mz);
+        uart2_print(msg_out); 
+
+        // Balanced delay: short enough for flight response, long enough for ESP32 processing
+        for (volatile int i = 0; i < 100000; i++); 
     }
 }
